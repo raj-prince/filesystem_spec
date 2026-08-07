@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import collections
-import functools
 import logging
 import math
 import os
@@ -23,6 +22,150 @@ else:
     P = TypeVar("P")
 
 T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class LRUCache(Generic[K, V]):
+    """
+    Flexible, thread-safe LRU cache backed by OrderedDict.
+
+    Supports maxsize item limits, max_bytes footprint limits,
+    eviction callbacks, and bulk operations.
+    """
+
+    def __init__(
+        self,
+        maxsize: int | None = None,
+        max_bytes: int | None = None,
+        on_evict: Callable[[K, V], None] | None = None,
+        get_sizeof: Callable[[V], int] | None = None,
+        thread_safe: bool = True,
+    ) -> None:
+        self.maxsize = maxsize
+        self.max_bytes = max_bytes
+        self.on_evict = on_evict
+        self.get_sizeof = get_sizeof
+        self._cache: OrderedDict[K, V] = OrderedDict()
+        self._current_bytes = 0
+        self._lock = threading.RLock() if thread_safe else None
+
+    def _acquire(self) -> None:
+        if self._lock is not None:
+            self._lock.acquire()
+
+    def _release(self) -> None:
+        if self._lock is not None:
+            self._lock.release()
+
+    def get(self, key: K, default: Any = None) -> V | Any:
+        self._acquire()
+        try:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return default
+        finally:
+            self._release()
+
+    def __getitem__(self, key: K) -> V:
+        val = self.get(key, default=...)
+        if val is ...:
+            raise KeyError(key)
+        return val
+
+    def put(self, key: K, value: V) -> None:
+        self._acquire()
+        try:
+            size = self.get_sizeof(value) if self.get_sizeof else 0
+            if key in self._cache:
+                old_val = self._cache[key]
+                old_size = self.get_sizeof(old_val) if self.get_sizeof else 0
+                self._current_bytes -= old_size
+
+            self._cache[key] = value
+            self._cache.move_to_end(key)
+            self._current_bytes += size
+            self._enforce_capacity()
+        finally:
+            self._release()
+
+    def __setitem__(self, key: K, value: V) -> None:
+        self.put(key, value)
+
+    def put_many(self, items: list[tuple[K, V]]) -> None:
+        self._acquire()
+        try:
+            for k, v in items:
+                size = self.get_sizeof(v) if self.get_sizeof else 0
+                if k in self._cache:
+                    old_val = self._cache[k]
+                    old_size = self.get_sizeof(old_val) if self.get_sizeof else 0
+                    self._current_bytes -= old_size
+
+                self._cache[k] = v
+                self._cache.move_to_end(k)
+                self._current_bytes += size
+            self._enforce_capacity()
+        finally:
+            self._release()
+
+    def __delitem__(self, key: K) -> None:
+        self._acquire()
+        try:
+            if key not in self._cache:
+                raise KeyError(key)
+            val = self._cache.pop(key)
+            if self.get_sizeof:
+                self._current_bytes -= self.get_sizeof(val)
+            if self.on_evict:
+                self.on_evict(key, val)
+        finally:
+            self._release()
+
+    def _enforce_capacity(self) -> None:
+        while (self.maxsize is not None and len(self._cache) > self.maxsize) or (
+            self.max_bytes is not None and self._current_bytes > self.max_bytes
+        ):
+            k, v = self._cache.popitem(last=False)
+            if self.get_sizeof:
+                self._current_bytes -= self.get_sizeof(v)
+            if self.on_evict:
+                self.on_evict(k, v)
+
+    def clear(self) -> None:
+        self._acquire()
+        try:
+            if self.on_evict:
+                for k, v in list(self._cache.items()):
+                    self.on_evict(k, v)
+            self._cache.clear()
+            self._current_bytes = 0
+        finally:
+            self._release()
+
+    def __len__(self) -> int:
+        self._acquire()
+        try:
+            return len(self._cache)
+        finally:
+            self._release()
+
+    def __contains__(self, key: object) -> bool:
+        self._acquire()
+        try:
+            return key in self._cache
+        finally:
+            self._release()
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
 
 logger = logging.getLogger("fsspec.caching")
@@ -359,9 +502,9 @@ class BlockCache(BaseCache):
         self, blocksize: int, fetcher: Fetcher, size: int, maxblocks: int = 32
     ) -> None:
         super().__init__(blocksize, fetcher, size)
-        self.nblocks = math.ceil(size / blocksize)
+        self.nblocks = math.ceil(size / blocksize) if size else 0
         self.maxblocks = maxblocks
-        self._fetch_block_cached = functools.lru_cache(maxblocks)(self._fetch_block)
+        self._cache: LRUCache[int, bytes] = LRUCache(maxsize=maxblocks)
 
     def cache_info(self):
         """
@@ -372,18 +515,22 @@ class BlockCache(BaseCache):
         NamedTuple
             Returned directly from the LRU Cache used internally.
         """
-        return self._fetch_block_cached.cache_info()
+
+        class CacheInfo(NamedTuple):
+            hits: int
+            misses: int
+            maxsize: int
+            currsize: int
+
+        return CacheInfo(
+            self.hit_count, self.miss_count, self.maxblocks, len(self._cache)
+        )
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__
-        del state["_fetch_block_cached"]
-        return state
+        return self.__dict__.copy()
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
-        self._fetch_block_cached = functools.lru_cache(state["maxblocks"])(
-            self._fetch_block
-        )
 
     def _fetch(self, start: int | None, end: int | None) -> bytes:
         if start is None:
@@ -401,18 +548,24 @@ class BlockCache(BaseCache):
         """
         Fetch the block of data for `block_number`.
         """
-        if block_number > self.nblocks:
+        if block_number >= self.nblocks:
             raise ValueError(
-                f"'block_number={block_number}' is greater than "
+                f"'block_number={block_number}' is greater than or equal to "
                 f"the number of blocks ({self.nblocks})"
             )
 
+        cached_block = self._cache.get(block_number)
+        if cached_block is not None:
+            self.hit_count += 1
+            return cached_block
+
         start = block_number * self.blocksize
-        end = start + self.blocksize
+        end = min(start + self.blocksize, self.size)
         self.total_requested_bytes += end - start
         self.miss_count += 1
         logger.info("BlockCache fetching block %d", block_number)
         block_contents = super()._fetch(start, end)
+        self._cache.put(block_number, block_contents)
         return block_contents
 
     def _read_cache(
@@ -434,28 +587,49 @@ class BlockCache(BaseCache):
             end_pos = self.blocksize
 
         self.hit_count += 1
-        if start_block_number == end_block_number:
-            block: bytes = self._fetch_block_cached(start_block_number)
-            return block[start_pos:end_pos]
+        needed_blocks = list(range(start_block_number, end_block_number + 1))
 
-        else:
-            # read from the initial
-            out = [self._fetch_block_cached(start_block_number)[start_pos:]]
-
-            # intermediate blocks
-            # Note: it'd be nice to combine these into one big request. However
-            # that doesn't play nicely with our LRU cache.
-            out.extend(
-                map(
-                    self._fetch_block_cached,
-                    range(start_block_number + 1, end_block_number),
+        if all(b in self._cache for b in needed_blocks):
+            if start_block_number == end_block_number:
+                return self._cache[start_block_number][start_pos:end_pos]
+            else:
+                out = [self._cache[start_block_number][start_pos:]]
+                out.extend(
+                    self._cache[b]
+                    for b in range(start_block_number + 1, end_block_number)
                 )
-            )
+                out.append(self._cache[end_block_number][:end_pos])
+                return b"".join(out)
 
-            # final block
-            out.append(self._fetch_block_cached(end_block_number)[:end_pos])
+        start_byte = start_block_number * self.blocksize
+        end_byte = min((end_block_number + 1) * self.blocksize, self.size)
 
-            return b"".join(out)
+        missing_blocks = [b for b in needed_blocks if b not in self._cache]
+        self.miss_count += len(missing_blocks)
+        self.total_requested_bytes += end_byte - start_byte
+        logger.info(
+            "BlockCache coalesced fetching blocks %d..%d",
+            start_block_number,
+            end_block_number,
+        )
+
+        fetched_data = super()._fetch(start_byte, end_byte)
+
+        items_to_cache = []
+        for idx, b in enumerate(needed_blocks):
+            b_start = idx * self.blocksize
+            b_end = min((idx + 1) * self.blocksize, len(fetched_data))
+            block_bytes = fetched_data[b_start:b_end]
+            items_to_cache.append((b, block_bytes))
+
+        if self.maxblocks and len(items_to_cache) > self.maxblocks:
+            items_to_cache = items_to_cache[-self.maxblocks :]
+
+        self._cache.put_many(items_to_cache)
+
+        slice_start = start - start_byte
+        slice_end = slice_start + (end - start)
+        return fetched_data[slice_start:slice_end]
 
 
 class BytesCache(BaseCache):

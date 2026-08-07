@@ -7,6 +7,7 @@ from fsspec.caching import (
     BackgroundBlockCache,
     BlockCache,
     FirstChunkCache,
+    LRUCache,
     MMapCache,
     ReadAheadCache,
     caches,
@@ -75,6 +76,25 @@ def test_block_cache_lru_no_redundant_reads():
     )
     cache._fetch(0, block_size * (maxblocks + 1))
     assert cache.cache_info().misses == 3
+
+
+def test_block_cache_coalesced_fetch():
+    fetch_calls = []
+
+    def mock_fetcher(start, end):
+        fetch_calls.append((start, end))
+        return letters_fetcher(start, end)
+
+    block_size = 10
+    cache = BlockCache(block_size, mock_fetcher, 100, maxblocks=10)
+
+    # Read spanning 3 blocks (0..30)
+    data = cache._fetch(0, 30)
+    assert data == letters_fetcher(0, 30)
+    # Should result in 1 single coalesced fetch call for bytes 0..30
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0] == (0, 30)
+    assert cache.cache_info().currsize == 3
 
 
 def test_first_cache():
@@ -359,3 +379,36 @@ def test_cache_kwargs(mocker):
     # It is a random location that cannot be predicted.
     # The important thing is the 'overwrite' kwarg
     fs.fs.put.assert_called_with(fs.fs.put.call_args[0][0], ["/test"], overwrite=True)
+
+
+def test_lru_cache_standalone():
+    evicted = []
+
+    def on_evict(k, v):
+        evicted.append((k, v))
+
+    cache = LRUCache[int, bytes](
+        maxsize=2, max_bytes=10, get_sizeof=len, on_evict=on_evict
+    )
+    cache.put(1, b"hello")  # 5 bytes
+    cache.put(2, b"world")  # 5 bytes (total 10 bytes)
+    assert len(cache) == 2
+    assert cache.get(1) == b"hello"
+
+    # Adding 3rd item should trigger maxsize / max_bytes eviction of key 2 (key 1 was accessed)
+    cache.put(3, b"foo")
+    assert len(cache) <= 2
+    assert len(evicted) > 0
+    assert 2 in [k for k, v in evicted]
+
+    # Test put_many
+    cache.clear()
+    cache.put_many([(10, b"a"), (20, b"b")])
+    assert cache.get(10) == b"a"
+    assert cache.get(20) == b"b"
+
+    # Test pickling
+    cache.on_evict = None
+    dumped = pickle.dumps(cache)
+    loaded = pickle.loads(dumped)
+    assert loaded.get(10) == b"a"
